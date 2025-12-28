@@ -16,7 +16,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/data/azcosmos"
 	"github.com/abhirockzz/cosmosdb-go-sdk-helper/auth"
 	util "github.com/abhirockzz/cosmosdb-go-sdk-helper/common"
-	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/assert"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -27,16 +26,34 @@ const (
 	testOperationContainerName = "testContainer"
 	testPartitionKey           = "/category"
 
-	emulatorImage = "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview"
+	emulatorImage = "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-EN20251223"
 	// emulatorImage    = "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:latest"
-	emulatorPort     = "8081"
-	emulatorEndpoint = "https://localhost:8081"
+	emulatorPort = "8081"
+	healthPort   = "8080"
+	//emulatorEndpoint = "https://localhost:8081"
 )
 
 var (
-	emulator testcontainers.Container
-	client   *azcosmos.Client
+	emulator         testcontainers.Container
+	client           *azcosmos.Client
+	emulatorEndpoint string
 )
+
+// emulatorTransport is a custom http.RoundTripper that intercepts requests to the Cosmos DB emulator.
+// The emulator advertises its internal port (8081) during endpoint discovery, which causes the SDK
+// to try connecting to localhost:8081 instead of the mapped Testcontainers port.
+// This transport rewrites the destination port to the mapped port to ensure connectivity.
+type emulatorTransport struct {
+	transport  http.RoundTripper
+	mappedPort string
+}
+
+func (t *emulatorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Port() == emulatorPort {
+		req.URL.Host = fmt.Sprintf("localhost:%s", t.mappedPort)
+	}
+	return t.transport.RoundTrip(req)
+}
 
 func TestMain(m *testing.M) {
 	// Set up the CosmosDB emulator container
@@ -49,16 +66,32 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	transport := &http.Client{Transport: &http.Transport{
+	mappedPort, err := emulator.MappedPort(context.Background(), emulatorPort)
+	if err != nil {
+		fmt.Printf("Failed to mapped port: %v\n", err)
+		os.Exit(1)
+	}
+
+	baseTransport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}}
+	}
+
+	// Wrap the base transport with our custom emulatorTransport to handle port rewriting
+	rewritingTransport := &emulatorTransport{
+		transport:  baseTransport,
+		mappedPort: mappedPort.Port(),
+	}
 
 	options := &azcosmos.ClientOptions{ClientOptions: azcore.ClientOptions{
-		Transport: transport,
+		Transport: &http.Client{Transport: rewritingTransport},
 	}}
 
+	emulatorEndpoint = fmt.Sprintf("https://localhost:%s", mappedPort.Port())
+	fmt.Printf("Emulator endpoint: %s\n", emulatorEndpoint)
+
 	// Set up the CosmosDB client
-	client, err = auth.GetEmulatorClientWithAzureADAuth(emulatorEndpoint, options)
+	client, err = auth.GetCosmosDBClient(emulatorEndpoint, true, options)
+
 	if err != nil {
 		fmt.Printf("Failed to set up CosmosDB client: %v\n", err)
 		os.Exit(1)
@@ -316,11 +349,11 @@ func TestGetItem_FailureScenarios(t *testing.T) {
 // setupCosmosDBEmulator creates a CosmosDB emulator container for testing
 func setupCosmosDBEmulator(ctx context.Context) (testcontainers.Container, error) {
 	req := testcontainers.ContainerRequest{
-		Image:        emulatorImage,
-		ExposedPorts: []string{emulatorPort + ":8081"},
-		WaitingFor:   wait.ForListeningPort(nat.Port(emulatorPort)),
+		Image: emulatorImage,
+		//ExposedPorts: []string{emulatorPort + ":8081"},
+		ExposedPorts: []string{emulatorPort, healthPort},
+		WaitingFor:   wait.ForListeningPort(healthPort),
 		Env: map[string]string{
-			//"AZURE_COSMOS_EMULATOR_PARTITION_COUNT": "5",
 			"ENABLE_EXPLORER": "false",
 			"PROTOCOL":        "https",
 		},
@@ -333,9 +366,6 @@ func setupCosmosDBEmulator(ctx context.Context) (testcontainers.Container, error
 	if err != nil {
 		return nil, fmt.Errorf("failed to start container: %w", err)
 	}
-
-	// Give the emulator a bit more time to fully initialize
-	time.Sleep(5 * time.Second)
 
 	return container, nil
 }
@@ -353,7 +383,7 @@ func setupDatabaseAndContainer() error {
 	_, err = util.CreateContainerIfNotExists(db, azcosmos.ContainerProperties{
 		ID: testOperationContainerName,
 		PartitionKeyDefinition: azcosmos.PartitionKeyDefinition{
-			Paths: []string{"/category"},
+			Paths: []string{testPartitionKey},
 			Kind:  azcosmos.PartitionKeyKindHash,
 		},
 	}, nil)
